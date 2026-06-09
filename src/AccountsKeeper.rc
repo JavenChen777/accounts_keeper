@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDI_ACCOUNT_KEEPER ICON "../account_keeper.ico"
