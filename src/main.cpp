@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <wincrypt.h>
 #include <winhttp.h>
@@ -18,6 +19,7 @@
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Bcrypt.lib")
 
 namespace {
 
@@ -101,6 +103,7 @@ struct AppState {
     std::wstring supabaseKey;
     std::wstring configPath;
     std::wstring backupPath;
+    std::vector<BYTE> masterKey;  // 32-byte AES-256 key derived from master password
 };
 
 AppState g;
@@ -194,7 +197,163 @@ std::vector<BYTE> Base64Decode(const std::string& text) {
     return out;
 }
 
-DATA_BLOB EntropyBlob() {
+// ── Cryptography ──────────────────────────────────────────────────────────
+//
+// Account fields are encrypted with AES-256-CBC.  The key is derived from the
+// master password via PBKDF2-SHA256 (200 000 iterations) with a fixed
+// application-wide salt so the same password produces the same key on every
+// machine.  Each ciphertext carries its own random 16-byte IV.
+//
+// Format stored in Supabase / backup JSON:
+//   "aes256:v1:<Base64( IV[16] || ciphertext )>"
+//
+// Legacy blobs with the "dpapi:v1:" prefix (produced by the old DPAPI scheme)
+// are still readable via CryptUnprotectData so existing cloud data can be
+// migrated by simply re-saving each account.
+//
+// The proxy password is stored locally with DPAPI (machine-bound is fine for
+// a per-machine setting and requires no cross-machine portability).
+
+// Fixed 32-byte salt for PBKDF2 – same on every machine so the same master
+// password always derives the same AES key.
+static const BYTE APP_PBKDF2_SALT[32] = {
+    0x41,0x63,0x63,0x74,0x73,0x4B,0x65,0x65,   // "ActsKee"
+    0x70,0x65,0x72,0x2E,0x76,0x31,0x2E,0x73,   // "per.v1.s"
+    0x61,0x6C,0x74,0x2E,0x41,0x45,0x53,0x32,   // "alt.AES2"
+    0x35,0x36,0x00,0x00,0x00,0x00,0x00,0x00    // "56\0..."
+};
+
+// Known plaintext encrypted with the master key and stored in settings.ini;
+// used to verify the password is correct on each login.
+static const char VERIFY_PLAINTEXT[] = "AccountsKeeper.master.verify.v1";
+
+// Derive a 32-byte AES-256 key from a UTF-8 password using PBKDF2-SHA256.
+// Returns an empty vector on failure.
+static std::vector<BYTE> DeriveKeyFromPassword(const std::string& passwordUtf8) {
+    std::vector<BYTE> key(32, 0);
+    BCRYPT_ALG_HANDLE hPrf = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hPrf, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        return {};
+    NTSTATUS st = BCryptDeriveKeyPBKDF2(
+        hPrf,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(passwordUtf8.data())),
+        static_cast<ULONG>(passwordUtf8.size()),
+        const_cast<PUCHAR>(APP_PBKDF2_SALT),
+        static_cast<ULONG>(sizeof(APP_PBKDF2_SALT)),
+        200000ULL,
+        key.data(),
+        static_cast<ULONG>(key.size()),
+        0);
+    BCryptCloseAlgorithmProvider(hPrf, 0);
+    return (st == 0) ? key : std::vector<BYTE>{};
+}
+
+static bool CryptoRandBytes(BYTE* buf, DWORD count) {
+    BCRYPT_ALG_HANDLE h = nullptr;
+    if (BCryptOpenAlgorithmProvider(&h, BCRYPT_RNG_ALGORITHM, nullptr, 0) != 0) return false;
+    bool ok = (BCryptGenRandom(h, buf, count, 0) == 0);
+    BCryptCloseAlgorithmProvider(h, 0);
+    return ok;
+}
+
+// AES-256-CBC encrypt with an explicit key.
+// Returns "aes256:v1:<Base64(IV[16] + ciphertext)>" or "" on failure.
+static std::string AesEncryptWithKey(const std::vector<BYTE>& key, const std::string& plain) {
+    if (key.size() != 32) return "";
+
+    BYTE iv[16]{};
+    if (!CryptoRandBytes(iv, 16)) return "";
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) return "";
+
+    static const WCHAR kCbcMode[] = BCRYPT_CHAIN_MODE_CBC;
+    BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                      reinterpret_cast<PUCHAR>(const_cast<WCHAR*>(kCbcMode)),
+                      sizeof(kCbcMode), 0);
+
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+                                   const_cast<PUCHAR>(key.data()), 32, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return "";
+    }
+
+    auto* plainBytes = reinterpret_cast<PUCHAR>(const_cast<char*>(plain.data()));
+    ULONG  plainLen  = static_cast<ULONG>(plain.size());
+
+    // First call: get required output buffer size
+    BYTE   ivCopy[16];
+    std::memcpy(ivCopy, iv, 16);
+    ULONG cbResult = 0;
+    BCryptEncrypt(hKey, plainBytes, plainLen, nullptr,
+                  ivCopy, 16, nullptr, 0, &cbResult, BCRYPT_BLOCK_PADDING);
+
+    std::vector<BYTE> cipher(cbResult);
+    std::memcpy(ivCopy, iv, 16);   // BCryptEncrypt modifies the IV buffer
+    NTSTATUS st = BCryptEncrypt(hKey, plainBytes, plainLen, nullptr,
+                                ivCopy, 16, cipher.data(), cbResult,
+                                &cbResult, BCRYPT_BLOCK_PADDING);
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (st != 0) return "";
+    cipher.resize(cbResult);
+
+    std::vector<BYTE> blob;
+    blob.reserve(16 + cipher.size());
+    blob.insert(blob.end(), iv, iv + 16);
+    blob.insert(blob.end(), cipher.begin(), cipher.end());
+    return "aes256:v1:" + Base64Encode(blob);
+}
+
+// AES-256-CBC decrypt with an explicit key.
+// Expects the portion after "aes256:v1:" (Base64 of IV[16] + ciphertext).
+static bool AesDecryptWithKey(const std::vector<BYTE>& key,
+                               const std::string& b64IvCipher,
+                               std::string& plain) {
+    if (key.size() != 32) return false;
+
+    std::vector<BYTE> blob = Base64Decode(b64IvCipher);
+    if (blob.size() < 16 + 16) return false;   // at least IV + one AES block
+
+    BYTE  iv[16]{};
+    std::memcpy(iv, blob.data(), 16);
+    PUCHAR cipherData = blob.data() + 16;
+    ULONG  cipherLen  = static_cast<ULONG>(blob.size() - 16);
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) return false;
+
+    static const WCHAR kCbcMode[] = BCRYPT_CHAIN_MODE_CBC;
+    BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                      reinterpret_cast<PUCHAR>(const_cast<WCHAR*>(kCbcMode)),
+                      sizeof(kCbcMode), 0);
+
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+                                   const_cast<PUCHAR>(key.data()), 32, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    std::vector<BYTE> plainBuf(cipherLen);
+    ULONG cbResult = 0;
+    NTSTATUS st = BCryptDecrypt(hKey, cipherData, cipherLen, nullptr,
+                                iv, 16,
+                                plainBuf.data(), static_cast<ULONG>(plainBuf.size()),
+                                &cbResult, BCRYPT_BLOCK_PADDING);
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (st != 0) return false;
+
+    plain.assign(reinterpret_cast<char*>(plainBuf.data()), cbResult);
+    return true;
+}
+
+// ── DPAPI helpers (proxy password + legacy account migration) ─────────────
+
+static DATA_BLOB LegacyEntropyBlob() {
     static const char entropy[] = "AccountsKeeper.dpapi.v1";
     DATA_BLOB blob{};
     blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(entropy));
@@ -202,38 +361,53 @@ DATA_BLOB EntropyBlob() {
     return blob;
 }
 
-std::string ProtectUtf8(const std::string& plain) {
+static std::string DpapiProtect(const std::string& plain) {
     DATA_BLOB in{};
     in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()));
     in.cbData = static_cast<DWORD>(plain.size());
-    DATA_BLOB entropy = EntropyBlob();
+    DATA_BLOB entropy = LegacyEntropyBlob();
     DATA_BLOB out{};
-    if (!CryptProtectData(&in, L"AccountsKeeper", &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+    if (!CryptProtectData(&in, L"AccountsKeeper", &entropy, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &out))
         return "";
-    }
     std::vector<BYTE> bytes(out.pbData, out.pbData + out.cbData);
     LocalFree(out.pbData);
     return "dpapi:v1:" + Base64Encode(bytes);
 }
 
-bool UnprotectUtf8(const std::string& cipher, std::string& plain) {
+static bool DpapiUnprotect(const std::string& cipher, std::string& plain) {
     const std::string prefix = "dpapi:v1:";
-    if (cipher.rfind(prefix, 0) != 0) {
-        plain = cipher;
-        return true;
-    }
+    if (cipher.rfind(prefix, 0) != 0) { plain = cipher; return true; }
     std::vector<BYTE> bytes = Base64Decode(cipher.substr(prefix.size()));
     if (bytes.empty()) return false;
     DATA_BLOB in{};
     in.pbData = bytes.data();
     in.cbData = static_cast<DWORD>(bytes.size());
-    DATA_BLOB entropy = EntropyBlob();
+    DATA_BLOB entropy = LegacyEntropyBlob();
     DATA_BLOB out{};
-    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &out))
         return false;
-    }
-    plain.assign(reinterpret_cast<char*>(out.pbData), reinterpret_cast<char*>(out.pbData + out.cbData));
+    plain.assign(reinterpret_cast<char*>(out.pbData), out.cbData);
     LocalFree(out.pbData);
+    return true;
+}
+
+// ── Account-field encryption using the master key ─────────────────────────
+// Falls back to DPAPI for legacy ciphertext already in the cloud.
+
+std::string ProtectUtf8(const std::string& plain) {
+    return AesEncryptWithKey(g.masterKey, plain);
+}
+
+bool UnprotectUtf8(const std::string& cipher, std::string& plain) {
+    const std::string aesPrefix   = "aes256:v1:";
+    const std::string dpapiPrefix = "dpapi:v1:";
+    if (cipher.rfind(aesPrefix, 0) == 0)
+        return AesDecryptWithKey(g.masterKey, cipher.substr(aesPrefix.size()), plain);
+    if (cipher.rfind(dpapiPrefix, 0) == 0)
+        return DpapiUnprotect(cipher, plain);   // legacy on-device migration read
+    plain = cipher;
     return true;
 }
 
@@ -301,9 +475,11 @@ void LoadSettings() {
     g.settings.proxy = IniRead(L"proxy", L"server");
     g.settings.proxyUser = IniRead(L"proxy", L"user");
     std::wstring protectedPassword = IniRead(L"proxy", L"password");
-    bool ok = true;
-    g.settings.proxyPassword = protectedPassword.empty() ? L"" : UnprotectWideFromStore(WideToUtf8(protectedPassword), ok);
-    if (!ok) g.settings.proxyPassword.clear();
+    if (!protectedPassword.empty()) {
+        std::string plain;
+        if (DpapiUnprotect(WideToUtf8(protectedPassword), plain))
+            g.settings.proxyPassword = Utf8ToWide(plain);
+    }
     g.settings.startup = IsStartupEnabled();
 }
 
@@ -317,7 +493,8 @@ void SaveSettingsFromUi() {
     IniWrite(L"proxy", L"enabled", g.settings.proxyEnabled ? L"1" : L"0");
     IniWrite(L"proxy", L"server", g.settings.proxy);
     IniWrite(L"proxy", L"user", g.settings.proxyUser);
-    IniWrite(L"proxy", L"password", g.settings.proxyPassword.empty() ? L"" : ProtectWideForStore(g.settings.proxyPassword));
+    IniWrite(L"proxy", L"password", g.settings.proxyPassword.empty() ? L"" :
+             Utf8ToWide(DpapiProtect(WideToUtf8(g.settings.proxyPassword))));
     SetStartupEnabled(g.settings.startup);
     SetStatus(L"Settings saved");
 }
@@ -1530,6 +1707,221 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ── Master-password dialog ─────────────────────────────────────────────────
+
+struct PasswordDlgState {
+    bool isFirstRun  = false;   // no verify blob in settings.ini yet
+    bool completed   = false;   // dialog finished (accepted or rejected)
+    bool accepted    = false;   // user clicked OK with a valid password
+    HWND editPwd     = nullptr;
+    HWND editConfirm = nullptr; // only present when isFirstRun
+    HWND lblError    = nullptr;
+};
+
+static PasswordDlgState s_pd;
+
+// Returns true when settings.ini already contains a verify blob.
+static bool MasterVerifyExists() {
+    return !IniRead(L"master", L"verify").empty();
+}
+
+// Try to decrypt the verify blob with a candidate key.
+// Returns true if the blob decrypts to VERIFY_PLAINTEXT (or if there is no
+// blob yet, meaning this is a fresh machine).
+static bool TryVerifyKey(const std::vector<BYTE>& key) {
+    std::wstring stored = IniRead(L"master", L"verify");
+    if (stored.empty()) return true;    // first run on this machine
+    std::string cipher = WideToUtf8(stored);
+    const std::string pfx = "aes256:v1:";
+    if (cipher.rfind(pfx, 0) != 0) return false;
+    std::string plain;
+    if (!AesDecryptWithKey(key, cipher.substr(pfx.size()), plain)) return false;
+    return plain == VERIFY_PLAINTEXT;
+}
+
+// Encrypt VERIFY_PLAINTEXT with the master key and persist to settings.ini.
+static void WriteVerifyBlob(const std::vector<BYTE>& key) {
+    std::string blob = AesEncryptWithKey(key, VERIFY_PLAINTEXT);
+    IniWrite(L"master", L"verify", Utf8ToWide(blob));
+}
+
+static void PwdDlgLayout(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    int m = 20, lw = 90;
+    int ew = w - m - lw - m;
+    // description label
+    MoveWindow(GetDlgItem(hwnd, 100), m, 14, w - 2 * m, 44, TRUE);
+    // password row
+    int y = 68;
+    MoveWindow(GetDlgItem(hwnd, 101), m, y + 3, lw, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, 102), m + lw, y, ew, 24, TRUE);
+    y += 32;
+    if (s_pd.isFirstRun) {
+        MoveWindow(GetDlgItem(hwnd, 103), m, y + 3, lw, 20, TRUE);
+        MoveWindow(GetDlgItem(hwnd, 104), m + lw, y, ew, 24, TRUE);
+        y += 32;
+    }
+    // error label
+    MoveWindow(GetDlgItem(hwnd, 105), m, y, w - 2 * m, 20, TRUE);
+    // buttons
+    int bw = 100, bh = 28;
+    int bx = (w - 2 * bw - 10) / 2;
+    MoveWindow(GetDlgItem(hwnd, IDOK),     bx,           h - bh - 14, bw, bh, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDCANCEL), bx + bw + 10, h - bh - 14, bw, bh, TRUE);
+}
+
+static LRESULT CALLBACK PwdDlgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT fnt = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD sty, DWORD exSty, int id) -> HWND {
+            HWND h = CreateWindowExW(exSty, cls, txt, WS_CHILD | WS_VISIBLE | sty,
+                                     0, 0, 0, 0, hwnd,
+                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                     g.instance, nullptr);
+            SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(fnt), TRUE);
+            return h;
+        };
+        const wchar_t* desc = s_pd.isFirstRun
+            ? L"Set a master password to protect your accounts.\r\n"
+              L"Use the same password on every machine running AccountsKeeper."
+            : L"Enter your master password to unlock your accounts.";
+        mk(L"STATIC", desc, SS_LEFT | SS_NOPREFIX, 0, 100);
+        mk(L"STATIC", L"Password:", SS_RIGHT | SS_CENTERIMAGE, 0, 101);
+        s_pd.editPwd = mk(L"EDIT", L"",
+                          ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
+                          WS_EX_CLIENTEDGE, 102);
+        if (s_pd.isFirstRun) {
+            mk(L"STATIC", L"Confirm:", SS_RIGHT | SS_CENTERIMAGE, 0, 103);
+            s_pd.editConfirm = mk(L"EDIT", L"",
+                                  ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
+                                  WS_EX_CLIENTEDGE, 104);
+        }
+        s_pd.lblError = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 0, 105);
+        const wchar_t* okLabel = s_pd.isFirstRun ? L"Set Password" : L"Unlock";
+        mk(L"BUTTON", okLabel, BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDOK);
+        mk(L"BUTTON", L"Exit",  BS_PUSHBUTTON   | WS_TABSTOP, 0, IDCANCEL);
+        SetFocus(s_pd.editPwd);
+        return 0;
+    }
+    case WM_SIZE:
+        PwdDlgLayout(hwnd);
+        return 0;
+    case WM_CLOSE:
+        s_pd.accepted  = false;
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDCANCEL:
+            s_pd.accepted = false;
+            DestroyWindow(hwnd);
+            return 0;
+        case IDOK: {
+            wchar_t buf[512]{};
+            GetWindowTextW(s_pd.editPwd, buf, static_cast<int>(std::size(buf)));
+            std::wstring pwd = buf;
+            SecureZeroMemory(buf, sizeof(buf));
+
+            if (pwd.size() < 6) {
+                SetWindowTextW(s_pd.lblError, L"Password must be at least 6 characters.");
+                return 0;
+            }
+            if (s_pd.isFirstRun) {
+                wchar_t buf2[512]{};
+                GetWindowTextW(s_pd.editConfirm, buf2, static_cast<int>(std::size(buf2)));
+                std::wstring pwd2 = buf2;
+                SecureZeroMemory(buf2, sizeof(buf2));
+                if (pwd != pwd2) {
+                    SetWindowTextW(s_pd.lblError, L"Passwords do not match.");
+                    return 0;
+                }
+            }
+
+            SetWindowTextW(s_pd.lblError, L"Deriving key, please wait...");
+            UpdateWindow(hwnd);
+
+            std::vector<BYTE> key = DeriveKeyFromPassword(WideToUtf8(pwd));
+            SecureZeroMemory(&pwd[0], pwd.size() * sizeof(wchar_t));
+
+            if (key.empty()) {
+                SetWindowTextW(s_pd.lblError, L"Key derivation failed (BCrypt error).");
+                return 0;
+            }
+            if (!s_pd.isFirstRun && !TryVerifyKey(key)) {
+                SetWindowTextW(s_pd.lblError, L"Incorrect password – please try again.");
+                SetWindowTextW(s_pd.editPwd, L"");
+                SetFocus(s_pd.editPwd);
+                return 0;
+            }
+
+            g.masterKey = std::move(key);
+            // Write or refresh the verify blob for this machine.
+            WriteVerifyBlob(g.masterKey);
+            s_pd.accepted = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        }
+        break;
+    case WM_DESTROY:
+        s_pd.completed = true;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// Show the master-password dialog and block until it is closed.
+// Returns true when the user successfully authenticated.
+static bool RunPasswordDialog() {
+    s_pd = {};
+    s_pd.isFirstRun = !MasterVerifyExists();
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc   = PwdDlgWndProc;
+    wc.hInstance     = g.instance;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"AKPasswordDlg";
+    RegisterClassW(&wc);
+
+    int dlgW = 400;
+    int dlgH = s_pd.isFirstRun ? 272 : 232;
+    int sx   = GetSystemMetrics(SM_CXSCREEN);
+    int sy   = GetSystemMetrics(SM_CYSCREEN);
+    const wchar_t* title = s_pd.isFirstRun
+        ? L"AccountsKeeper \u2013 Set Master Password"
+        : L"AccountsKeeper \u2013 Enter Master Password";
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
+        L"AKPasswordDlg", title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        (sx - dlgW) / 2, (sy - dlgH) / 2, dlgW, dlgH,
+        nullptr, nullptr, g.instance, nullptr);
+    if (!dlg) {
+        UnregisterClassW(L"AKPasswordDlg", g.instance);
+        return false;
+    }
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    // Local message loop – runs until s_pd.completed is set in WM_DESTROY.
+    MSG msg{};
+    while (!s_pd.completed) {
+        BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+        if (got <= 0) break;
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    UnregisterClassW(L"AKPasswordDlg", g.instance);
+    return s_pd.accepted;
+}
+
 } // namespace
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
@@ -1546,6 +1938,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g.supabaseUrl = GetEnvVar(L"SUPABASE_URL");
     g.supabaseKey = GetEnvVar(L"SUPABASE_KEY");
     LoadSettings();
+
+    // ── Master password ────────────────────────────────────────────────────
+    // Must succeed before any account data is decrypted.
+    if (!RunPasswordDialog()) {
+        CloseHandle(g.singleInstanceMutex);
+        g.singleInstanceMutex = nullptr;
+        return 0;
+    }
 
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);

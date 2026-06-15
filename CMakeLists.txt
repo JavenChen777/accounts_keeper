@@ -17,6 +17,7 @@ target_compile_definitions(AccountsKeeper PRIVATE
 
 target_link_libraries(AccountsKeeper PRIVATE
     advapi32
+    bcrypt
     comctl32
     crypt32
     gdi32

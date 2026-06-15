@@ -73,6 +73,16 @@ cmake --build build --config Release
 
 `build_msvc.bat` auto-detects the Visual Studio installation via `vswhere`, compiles `src/main.cpp` as C++17, and links against `advapi32`, `comctl32`, `crypt32`, `gdi32`, `ole32`, `shell32`, `shlwapi`, `user32`, and `winhttp` — all Windows SDK libraries, no external dependencies.
 
-## Encryption note
+## Encryption
 
-Account fields are encrypted with Windows DPAPI bound to the current Windows user profile. Data stored in Supabase is always ciphertext. A different machine or Windows user profile cannot decrypt it without a portable master-key migration that is not currently implemented.
+Account fields are encrypted with **AES-256-CBC** using a key derived from your master password via **PBKDF2-SHA256** (200 000 iterations).  A fixed application-wide salt ensures the same password produces the same key on every machine, so any Windows PC running AccountsKeeper can decrypt data stored in Supabase — just use the same master password everywhere.
+
+The master password is never stored anywhere.  A small verification blob (`settings.ini [master] verify`) is written locally on each machine so the app can confirm the correct password was entered before loading data.
+
+**First run on a new machine:**  
+The app will prompt you to enter a master password.  If you have data on another machine already, enter **the same password** you used there — the confirmation field is shown so you type it twice.  If you mistype and create a different password, Supabase data will fail to decrypt (you'll see "(decrypt failed)" entries).  Delete the verify blob by removing `[master]` from `%APPDATA%\AccountsKeeper\settings.ini` and relaunch.
+
+**Legacy data (DPAPI-encrypted blobs):**  
+If you previously ran an older version, data already in Supabase carries a `dpapi:v1:` prefix and can still be read on the original machine.  To make it readable everywhere, open each account, then click **Save** — it will be re-encrypted with AES-256 and overwritten in Supabase.
+
+Proxy passwords remain DPAPI-encrypted because they are a per-machine setting.

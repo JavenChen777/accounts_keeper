@@ -21,4 +21,4 @@ cl /nologo /std:c++17 /EHsc ^
   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
   /Fo:build-direct\ /Fe:build-direct\AccountsKeeper.exe src\main.cpp build-direct\AccountsKeeper.res ^
   /link /SUBSYSTEM:WINDOWS ^
-  advapi32.lib comctl32.lib crypt32.lib gdi32.lib ole32.lib shell32.lib shlwapi.lib user32.lib winhttp.lib
+  advapi32.lib bcrypt.lib comctl32.lib crypt32.lib gdi32.lib ole32.lib shell32.lib shlwapi.lib user32.lib winhttp.lib
