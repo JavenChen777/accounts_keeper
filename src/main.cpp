@@ -46,6 +46,8 @@ enum ControlId {
     IDC_PROXY_PASS = 1016,
     IDC_STARTUP = 1017,
     IDC_SAVE_SETTINGS = 1018,
+    IDC_SEARCH = 1019,
+    IDC_EDIT_TOGGLE = 1020,
 };
 
 enum TrayCommand {
@@ -98,7 +100,13 @@ struct AppState {
     std::vector<Account> rows;
     int selected = -1;
     bool passwordVisible = true;
+    bool editMode = false;
+    HWND btnEdit = nullptr;
     bool exiting = false;
+    HWND searchEdit = nullptr;
+    int sortCol = -1;
+    bool sortAsc = true;
+    std::vector<int> displayIndices;
     std::wstring supabaseUrl;
     std::wstring supabaseKey;
     std::wstring configPath;
@@ -1059,6 +1067,41 @@ std::wstring SingleLinePreview(std::wstring value) {
     return value;
 }
 
+// ── Search & sort helpers ─────────────────────────────────────────────────
+
+static bool ContainsCI(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    return std::search(haystack.begin(), haystack.end(),
+        needle.begin(), needle.end(),
+        [](wchar_t a, wchar_t b) { return std::towlower(a) == std::towlower(b); }
+    ) != haystack.end();
+}
+
+// Fuzzy match: every whitespace-separated token in query must appear
+// as a substring in at least one of the account's visible fields.
+static bool AccountMatchesSearch(const Account& account, const std::wstring& query) {
+    if (query.empty()) return true;
+    std::wistringstream ss(query);
+    std::wstring token;
+    while (ss >> token) {
+        if (!ContainsCI(account.product, token) &&
+            !ContainsCI(account.username, token) &&
+            !ContainsCI(account.additional, token))
+            return false;
+    }
+    return true;
+}
+
+static const std::wstring& GetSortField(const Account& a, int col) {
+    switch (col) {
+    case 0: return a.product;
+    case 1: return a.username;
+    case 2: return a.password;
+    case 3: return a.additional;
+    default: return a.createdAt;
+    }
+}
+
 void AddListRow(int index, const Account& account) {
     std::wstring additional = SingleLinePreview(account.additional);
     LVITEMW item{};
@@ -1075,11 +1118,50 @@ void AddListRow(int index, const Account& account) {
     }
 }
 
+void BuildDisplayIndices() {
+    std::wstring query = g.searchEdit ? GetWindowTextString(g.searchEdit) : L"";
+    g.displayIndices.clear();
+    for (int i = 0; i < static_cast<int>(g.rows.size()); ++i) {
+        if (AccountMatchesSearch(g.rows[i], query))
+            g.displayIndices.push_back(i);
+    }
+    if (g.sortCol >= 0) {
+        std::stable_sort(g.displayIndices.begin(), g.displayIndices.end(),
+            [](int a, int b) {
+                const std::wstring& va = GetSortField(g.rows[a], g.sortCol);
+                const std::wstring& vb = GetSortField(g.rows[b], g.sortCol);
+                int cmp = _wcsicmp(va.c_str(), vb.c_str());
+                return g.sortAsc ? cmp < 0 : cmp > 0;
+            });
+    }
+}
+
+void UpdateSortHeader() {
+    HWND header = ListView_GetHeader(g.list);
+    if (!header) return;
+    int colCount = Header_GetItemCount(header);
+    for (int i = 0; i < colCount; ++i) {
+        HDITEMW hdi{};
+        hdi.mask = HDI_FORMAT;
+        Header_GetItem(header, i, &hdi);
+        hdi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == g.sortCol)
+            hdi.fmt |= g.sortAsc ? HDF_SORTUP : HDF_SORTDOWN;
+        Header_SetItem(header, i, &hdi);
+    }
+}
+
 void PopulateList() {
     ListView_DeleteAllItems(g.list);
-    for (int i = 0; i < static_cast<int>(g.rows.size()); ++i) {
-        AddListRow(i, g.rows[i]);
+    for (int i = 0; i < static_cast<int>(g.displayIndices.size()); ++i) {
+        AddListRow(i, g.rows[g.displayIndices[i]]);
     }
+}
+
+void RefreshDisplay() {
+    BuildDisplayIndices();
+    PopulateList();
+    UpdateSortHeader();
 }
 
 bool ParseAccounts(const std::string& json, std::vector<Account>& out, std::wstring& error) {
@@ -1199,7 +1281,7 @@ bool RefreshAccounts() {
         }
         SortAccounts(localRows);
         g.rows = std::move(localRows);
-        PopulateList();
+        RefreshDisplay();
         ClearEditor();
         std::wostringstream oss;
         oss << remoteError << L"; loaded " << g.rows.size() << L" local backup account(s)";
@@ -1249,7 +1331,7 @@ bool RefreshAccounts() {
 
     SortAccounts(remoteRows);
     g.rows = std::move(remoteRows);
-    PopulateList();
+    RefreshDisplay();
     ClearEditor();
     std::wostringstream oss;
     oss << L"Loaded " << g.rows.size() << L" account(s)";
@@ -1317,7 +1399,7 @@ bool SaveAccount() {
             }
             UpsertAccount(g.rows, remoteOk ? storedAccount : account);
             SortAccounts(g.rows);
-            PopulateList();
+            RefreshDisplay();
         }
         std::wostringstream oss;
         oss << L"Save incomplete:";
@@ -1408,7 +1490,7 @@ void Layout(HWND hwnd) {
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
     int pad = 16;
-    int toolbarH = 42;
+    int toolbarH = 76;  // two rows: buttons row + search row
     int statusH = 26;
     int listW = std::max(330, width * 42 / 100);
     int rightX = pad + listW + pad;
@@ -1426,6 +1508,14 @@ void Layout(HWND hwnd) {
         ResizeChild(ids[i], x, pad, buttonW[i], 30);
         x += buttonW[i] + 8;
     }
+    // Edit toggle button — right-aligned, visually separated from the rest
+    ResizeChild(g.btnEdit, width - pad - 80, pad, 80, 30);
+
+    // Search bar (second toolbar row)
+    int searchY = pad + 38;
+    int searchLabelW = 58;
+    ResizeChild(GetDlgItem(hwnd, 3008), pad, searchY + 5, searchLabelW, 18);
+    ResizeChild(g.searchEdit, pad + searchLabelW, searchY, listW - searchLabelW, 26);
 
     ResizeChild(g.list, pad, contentTop, listW, contentH);
 
@@ -1549,6 +1639,22 @@ void LoadSettingsToUi() {
     SendMessageW(g.chkStartup, BM_SETCHECK, g.settings.startup ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
+void UpdateEditModeButtons() {
+    BOOL enabled = g.editMode ? TRUE : FALSE;
+    EnableWindow(GetDlgItem(g.hwnd, IDC_NEW),       enabled);
+    EnableWindow(GetDlgItem(g.hwnd, IDC_SAVE),      enabled);
+    EnableWindow(GetDlgItem(g.hwnd, IDC_DELETE),    enabled);
+    EnableWindow(GetDlgItem(g.hwnd, IDC_COPY_USER), enabled);
+    EnableWindow(GetDlgItem(g.hwnd, IDC_COPY_PASS), enabled);
+
+    // Make editor fields read-only when not in edit mode
+    BOOL readOnly = g.editMode ? FALSE : TRUE;
+    SendMessageW(g.product,    EM_SETREADONLY, readOnly, 0);
+    SendMessageW(g.username,   EM_SETREADONLY, readOnly, 0);
+    SendMessageW(g.password,   EM_SETREADONLY, readOnly, 0);
+    SendMessageW(g.additional, EM_SETREADONLY, readOnly, 0);
+}
+
 void CreateUi(HWND hwnd) {
     NONCLIENTMETRICSW metrics{};
     metrics.cbSize = sizeof(metrics);
@@ -1563,9 +1669,16 @@ void CreateUi(HWND hwnd) {
     MakeControl(L"BUTTON", L"Delete", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, hwnd, IDC_DELETE);
     MakeControl(L"BUTTON", L"Copy user", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, hwnd, IDC_COPY_USER);
     MakeControl(L"BUTTON", L"Copy pass", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, hwnd, IDC_COPY_PASS);
+    g.btnEdit = MakeControl(L"BUTTON", L"Edit", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE, 0, hwnd, IDC_EDIT_TOGGLE);
 
     g.list = MakeControl(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_BORDER, 0, hwnd, IDC_LIST);
     InitListColumns();
+
+    {
+        HWND sl = MakeLabel(hwnd, L"Search:");
+        SetWindowLongPtrW(sl, GWLP_ID, 3008);
+    }
+    g.searchEdit = MakeControl(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, hwnd, IDC_SEARCH);
 
     HWND label = MakeLabel(hwnd, L"Product / URL");
     SetWindowLongPtrW(label, GWLP_ID, 3001);
@@ -1597,13 +1710,24 @@ void CreateUi(HWND hwnd) {
 
     g.status = MakeControl(L"STATIC", L"Ready", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, hwnd, 0);
     LoadSettingsToUi();
+    UpdateEditModeButtons();
     Layout(hwnd);
 }
 
 void OnCommand(WPARAM wParam) {
     switch (LOWORD(wParam)) {
+    case IDC_SEARCH:
+        if (HIWORD(wParam) == EN_CHANGE) {
+            RefreshDisplay();
+        }
+        break;
     case IDC_REFRESH:
         RefreshAccounts();
+        break;
+    case IDC_EDIT_TOGGLE:
+        g.editMode = (SendMessageW(g.btnEdit, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        UpdateEditModeButtons();
+        SetStatus(g.editMode ? L"Edit mode enabled" : L"Edit mode disabled");
         break;
     case IDC_NEW:
         ClearEditor();
@@ -1642,13 +1766,28 @@ void OnCommand(WPARAM wParam) {
 
 void OnNotify(LPARAM lParam) {
     auto* hdr = reinterpret_cast<NMHDR*>(lParam);
-    if (hdr->idFrom == IDC_LIST && hdr->code == LVN_ITEMCHANGED) {
-        auto* item = reinterpret_cast<NMLISTVIEW*>(lParam);
-        if ((item->uChanged & LVIF_STATE) && (item->uNewState & LVIS_SELECTED)) {
-            g.selected = item->iItem;
-            if (g.selected >= 0 && g.selected < static_cast<int>(g.rows.size())) {
-                FillEditor(g.rows[g.selected]);
+    if (hdr->idFrom == IDC_LIST) {
+        if (hdr->code == LVN_ITEMCHANGED) {
+            auto* item = reinterpret_cast<NMLISTVIEW*>(lParam);
+            if ((item->uChanged & LVIF_STATE) && (item->uNewState & LVIS_SELECTED)) {
+                int listIdx = item->iItem;
+                if (listIdx >= 0 && listIdx < static_cast<int>(g.displayIndices.size())) {
+                    g.selected = g.displayIndices[listIdx];
+                    if (g.selected >= 0 && g.selected < static_cast<int>(g.rows.size())) {
+                        FillEditor(g.rows[g.selected]);
+                    }
+                }
             }
+        } else if (hdr->code == LVN_COLUMNCLICK) {
+            auto* info = reinterpret_cast<NMLISTVIEW*>(lParam);
+            int col = info->iSubItem;
+            if (g.sortCol == col) {
+                g.sortAsc = !g.sortAsc;
+            } else {
+                g.sortCol = col;
+                g.sortAsc = true;
+            }
+            RefreshDisplay();
         }
     }
 }
