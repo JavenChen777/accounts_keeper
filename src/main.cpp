@@ -99,7 +99,7 @@ struct AppState {
     Settings settings;
     std::vector<Account> rows;
     int selected = -1;
-    bool passwordVisible = true;
+    bool passwordVisible = false;
     bool editMode = false;
     HWND btnEdit = nullptr;
     bool exiting = false;
@@ -1054,6 +1054,10 @@ void ClearEditor() {
 void FillEditor(const Account& account) {
     SetWindowTextW(g.product, account.product.c_str());
     SetWindowTextW(g.username, account.username.c_str());
+    // Always reset to hidden state when loading a new account
+    g.passwordVisible = false;
+    SendMessageW(g.password, EM_SETPASSWORDCHAR, L'*', 0);
+    SetWindowTextW(g.btnShowPass, L"Show");
     SetWindowTextW(g.password, account.password.c_str());
     SetWindowTextW(g.additional, account.additional.c_str());
 }
@@ -1110,7 +1114,7 @@ void AddListRow(int index, const Account& account) {
     item.pszText = const_cast<wchar_t*>(account.product.c_str());
     ListView_InsertItem(g.list, &item);
     ListView_SetItemText(g.list, index, 1, const_cast<wchar_t*>(account.username.c_str()));
-    ListView_SetItemText(g.list, index, 2, const_cast<wchar_t*>(account.password.c_str()));
+    ListView_SetItemText(g.list, index, 2, const_cast<wchar_t*>(account.password.empty() ? L"" : L"****"));
     ListView_SetItemText(g.list, index, 3, const_cast<wchar_t*>(additional.c_str()));
     ListView_SetItemText(g.list, index, 4, const_cast<wchar_t*>(account.createdAt.c_str()));
     if (!account.decryptOk) {
@@ -1699,7 +1703,8 @@ void CreateUi(HWND hwnd) {
     g.username = MakeControl(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, hwnd, IDC_USERNAME);
     g.password = MakeControl(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, hwnd, IDC_PASSWORD);
     g.additional = MakeControl(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, hwnd, IDC_ADDITIONAL);
-    g.btnShowPass = MakeControl(L"BUTTON", L"Hide", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, hwnd, IDC_SHOW_PASS);
+    g.btnShowPass = MakeControl(L"BUTTON", L"Show", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, hwnd, IDC_SHOW_PASS);
+    SendMessageW(g.password, EM_SETPASSWORDCHAR, L'*', 0);
 
     g.chkProxy = MakeControl(L"BUTTON", L"Proxy", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, hwnd, IDC_PROXY_ENABLE);
     g.proxy = MakeControl(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, hwnd, IDC_PROXY);
