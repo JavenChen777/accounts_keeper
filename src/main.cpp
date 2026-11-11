@@ -26,6 +26,7 @@ namespace {
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr int HOTKEY_ID = 42;
 constexpr int TRAY_UID = 7;
+constexpr const wchar_t* kDefaultTursoUrl = L"libsql://accounts-javenchen777.aws-ap-northeast-1.turso.io";
 
 enum ControlId {
     IDC_LIST = 1001,
@@ -107,8 +108,8 @@ struct AppState {
     int sortCol = -1;
     bool sortAsc = true;
     std::vector<int> displayIndices;
-    std::wstring supabaseUrl;
-    std::wstring supabaseKey;
+    std::wstring tursoUrl;
+    std::wstring tursoToken;
     std::wstring configPath;
     std::wstring backupPath;
     std::vector<BYTE> masterKey;  // 32-byte AES-256 key derived from master password
@@ -212,7 +213,7 @@ std::vector<BYTE> Base64Decode(const std::string& text) {
 // application-wide salt so the same password produces the same key on every
 // machine.  Each ciphertext carries its own random 16-byte IV.
 //
-// Format stored in Supabase / backup JSON:
+// Format stored in Turso / backup JSON:
 //   "aes256:v1:<Base64( IV[16] || ciphertext )>"
 //
 // Legacy blobs with the "dpapi:v1:" prefix (produced by the old DPAPI scheme)
@@ -793,24 +794,10 @@ private:
     size_t pos_ = 0;
 };
 
-std::string UrlEncode(const std::string& input) {
-    static const char* hex = "0123456789ABCDEF";
-    std::string out;
-    for (unsigned char c : input) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(c >> 4) & 0xF]);
-            out.push_back(hex[c & 0xF]);
-        }
-    }
-    return out;
-}
-
-class SupabaseClient {
+// Turso database client: posts Hrana pipeline requests to <url>/v2/pipeline.
+class TursoClient {
 public:
-    SupabaseClient(std::wstring url, std::wstring key, Settings settings)
+    TursoClient(std::wstring url, std::wstring key, Settings settings)
         : url_(std::move(url)), key_(std::move(key)), settings_(std::move(settings)) {
         ParseUrl();
     }
@@ -819,10 +806,11 @@ public:
         return ready_ && !key_.empty();
     }
 
-    bool Request(const wchar_t* method, const std::wstring& path, const std::string& body,
-                 DWORD& status, std::string& response, std::wstring& error) {
+    bool Request(const std::string& body, DWORD& status, std::string& response, std::wstring& error) {
+        const wchar_t* method = L"POST";
+        const std::wstring path = L"/v2/pipeline";
         if (!IsReady()) {
-            error = L"Missing or invalid SUPABASE_URL/SUPABASE_KEY";
+            error = L"Missing or invalid Turso URL / Turso_Token";
             return false;
         }
 
@@ -868,15 +856,9 @@ public:
         }
 
         std::wstring headers =
-            L"apikey: " + key_ + L"\r\n"
             L"Authorization: Bearer " + key_ + L"\r\n"
             L"Content-Type: application/json\r\n"
             L"Accept: application/json\r\n";
-        if (body.empty()) {
-            headers += L"Prefer: return=representation\r\n";
-        } else {
-            headers += L"Prefer: return=representation\r\n";
-        }
 
         BOOL ok = WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
             body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()),
@@ -923,6 +905,9 @@ private:
         comps.dwHostNameLength = static_cast<DWORD>(std::size(host));
         comps.lpszUrlPath = path;
         comps.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+        // WinHTTP only understands http(s); libsql:// is the same endpoint over HTTPS.
+        const std::wstring libsql = L"libsql://";
+        if (url_.compare(0, libsql.size(), libsql) == 0) url_ = L"https://" + url_.substr(libsql.size());
         if (!WinHttpCrackUrl(url_.c_str(), 0, 0, &comps)) return;
         host_.assign(comps.lpszHostName, comps.dwHostNameLength);
         basePath_.assign(comps.lpszUrlPath, comps.dwUrlPathLength);
@@ -974,31 +959,6 @@ std::string AccountJsonObject(const Account& account) {
         "}";
 }
 
-bool IsIntegerId(const std::string& id) {
-    return !id.empty() && std::all_of(id.begin(), id.end(), [](unsigned char ch) {
-        return std::isdigit(ch) != 0;
-    });
-}
-
-std::string AccountStoreBody(const Account& account, bool includeId) {
-    std::ostringstream out;
-    out << "{";
-    bool wrote = false;
-    auto field = [&](const std::string& key, const std::string& value) {
-        if (wrote) out << ",";
-        out << JsonString(key) << ":" << JsonString(value);
-        wrote = true;
-    };
-    if (includeId) field("id", account.id);
-    field("product_name_url", account.encryptedProduct);
-    field("username", account.encryptedUsername);
-    field("password", account.encryptedPassword);
-    field("additional", account.encryptedAdditional);
-    field("created_at", WideToUtf8(account.createdAt));
-    out << "}";
-    return out.str();
-}
-
 std::string AccountsJsonArray(const std::vector<Account>& accounts) {
     std::ostringstream out;
     out << "[";
@@ -1008,10 +968,6 @@ std::string AccountsJsonArray(const std::vector<Account>& accounts) {
     }
     out << "]";
     return out.str();
-}
-
-std::string AccountBody(const Account& account, bool update) {
-    return AccountStoreBody(account, update || IsIntegerId(account.id));
 }
 
 void SortAccounts(std::vector<Account>& accounts) {
@@ -1028,7 +984,7 @@ Account AccountFromUi() {
 
     Account account;
     bool update = g.selected >= 0 && g.selected < static_cast<int>(g.rows.size()) && !g.rows[g.selected].id.empty();
-    account.id = update ? g.rows[g.selected].id : "local:" + NewGuidString();
+    account.id = update ? g.rows[g.selected].id : NewGuidString();
     account.createdAt = update ? g.rows[g.selected].createdAt : UtcNowIso();
     account.encryptedProduct = WideToUtf8(ProtectWideForStore(product));
     account.encryptedUsername = WideToUtf8(ProtectWideForStore(username));
@@ -1168,43 +1124,141 @@ void RefreshDisplay() {
     UpdateSortHeader();
 }
 
+Account AccountFromJson(const JsonValue& item) {
+    Account account;
+    const JsonValue* id = item.Get("id");
+    const JsonValue* product = item.Get("product_name_url");
+    const JsonValue* username = item.Get("username");
+    const JsonValue* password = item.Get("password");
+    const JsonValue* additional = item.Get("additional");
+    const JsonValue* created = item.Get("created_at");
+
+    account.id = id ? id->AsString() : "";
+    account.encryptedProduct = product ? product->AsString() : "";
+    account.encryptedUsername = username ? username->AsString() : "";
+    account.encryptedPassword = password ? password->AsString() : "";
+    account.encryptedAdditional = additional ? additional->AsString() : "";
+    bool okProduct = true;
+    bool okUser = true;
+    bool okPass = true;
+    bool okAdditional = true;
+    account.product = product ? UnprotectWideFromStore(account.encryptedProduct, okProduct) : L"";
+    account.username = username ? UnprotectWideFromStore(account.encryptedUsername, okUser) : L"";
+    account.password = password ? UnprotectWideFromStore(account.encryptedPassword, okPass) : L"";
+    account.additional = additional ? UnprotectWideFromStore(account.encryptedAdditional, okAdditional) : L"";
+    account.createdAt = created ? Utf8ToWide(created->AsString()) : L"";
+    account.decryptOk = okProduct && okUser && okPass && okAdditional;
+    return account;
+}
+
 bool ParseAccounts(const std::string& json, std::vector<Account>& out, std::wstring& error) {
     JsonValue root;
     JsonParser parser(json);
     if (!parser.Parse(root) || root.type != JsonValue::Type::Array) {
-        error = L"Supabase returned invalid JSON";
+        error = L"Invalid account JSON";
         return false;
     }
 
     out.clear();
     for (const auto& item : root.array) {
-        if (item.type != JsonValue::Type::Object) continue;
-        Account account;
-        const JsonValue* id = item.Get("id");
-        const JsonValue* product = item.Get("product_name_url");
-        const JsonValue* username = item.Get("username");
-        const JsonValue* password = item.Get("password");
-        const JsonValue* additional = item.Get("additional");
-        const JsonValue* created = item.Get("created_at");
-
-        account.id = id ? id->AsString() : "";
-        account.encryptedProduct = product ? product->AsString() : "";
-        account.encryptedUsername = username ? username->AsString() : "";
-        account.encryptedPassword = password ? password->AsString() : "";
-        account.encryptedAdditional = additional ? additional->AsString() : "";
-        bool okProduct = true;
-        bool okUser = true;
-        bool okPass = true;
-        bool okAdditional = true;
-        account.product = product ? UnprotectWideFromStore(account.encryptedProduct, okProduct) : L"";
-        account.username = username ? UnprotectWideFromStore(account.encryptedUsername, okUser) : L"";
-        account.password = password ? UnprotectWideFromStore(account.encryptedPassword, okPass) : L"";
-        account.additional = additional ? UnprotectWideFromStore(account.encryptedAdditional, okAdditional) : L"";
-        account.createdAt = created ? Utf8ToWide(created->AsString()) : L"";
-        account.decryptOk = okProduct && okUser && okPass && okAdditional;
-        out.push_back(std::move(account));
+        if (item.type == JsonValue::Type::Object) out.push_back(AccountFromJson(item));
     }
     return true;
+}
+
+// ── Turso (Hrana over HTTP) ───────────────────────────────────────────────
+
+struct SqlStatement {
+    std::string sql;
+    std::vector<std::string> args;
+};
+
+const char* const kCreateTableSql =
+    "CREATE TABLE IF NOT EXISTS accounts ("
+    "id TEXT PRIMARY KEY,"
+    "product_name_url TEXT NOT NULL,"
+    "username TEXT NOT NULL,"
+    "password TEXT NOT NULL,"
+    "additional TEXT,"
+    "created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))";
+
+const char* const kAccountColumns = "id, product_name_url, username, password, additional, created_at";
+
+std::string HranaStatement(const SqlStatement& stmt) {
+    std::ostringstream out;
+    out << "{\"type\":\"execute\",\"stmt\":{\"sql\":" << JsonString(stmt.sql) << ",\"args\":[";
+    for (size_t i = 0; i < stmt.args.size(); ++i) {
+        if (i) out << ",";
+        out << "{\"type\":\"text\",\"value\":" << JsonString(stmt.args[i]) << "}";
+    }
+    out << "]}}";
+    return out.str();
+}
+
+// Runs the statements (after ensuring the table exists) in one pipeline.
+// If rows is non-null it receives the result rows of the last statement.
+bool TursoRun(TursoClient& client, const std::vector<SqlStatement>& stmts, std::vector<Account>* rows,
+              DWORD& status, std::string& response, std::wstring& error) {
+    std::string body = "{\"requests\":[" + HranaStatement({kCreateTableSql, {}});
+    for (const auto& stmt : stmts) body += "," + HranaStatement(stmt);
+    body += ",{\"type\":\"close\"}]}";
+
+    if (!client.Request(body, status, response, error)) return false;
+
+    JsonValue root;
+    JsonParser parser(response);
+    const JsonValue* results = parser.Parse(root) ? root.Get("results") : nullptr;
+    if (!results || results->type != JsonValue::Type::Array || results->array.size() < stmts.size() + 1) {
+        error = L"Turso returned an invalid response";
+        return false;
+    }
+
+    for (size_t i = 0; i < stmts.size() + 1; ++i) {
+        const JsonValue& result = results->array[i];
+        const JsonValue* type = result.Get("type");
+        if (!type || type->AsString() != "ok") {
+            const JsonValue* err = result.Get("error");
+            const JsonValue* message = err ? err->Get("message") : nullptr;
+            error = L"Turso error: " + (message ? Utf8ToWide(message->AsString()) : std::wstring(L"unknown"));
+            return false;
+        }
+    }
+
+    if (!rows) return true;
+    rows->clear();
+    const JsonValue* last = results->array[stmts.size()].Get("response");
+    const JsonValue* data = last ? last->Get("result") : nullptr;
+    const JsonValue* cols = data ? data->Get("cols") : nullptr;
+    const JsonValue* rowArray = data ? data->Get("rows") : nullptr;
+    if (!cols || !rowArray) return true;
+
+    for (const auto& row : rowArray->array) {
+        JsonValue obj;
+        obj.type = JsonValue::Type::Object;
+        for (size_t c = 0; c < cols->array.size() && c < row.array.size(); ++c) {
+            const JsonValue* name = cols->array[c].Get("name");
+            const JsonValue* value = row.array[c].Get("value");
+            if (!name) continue;
+            JsonValue cell;
+            cell.type = JsonValue::Type::String;
+            cell.string = value ? value->AsString() : "";
+            obj.object.emplace(name->AsString(), std::move(cell));
+        }
+        rows->push_back(AccountFromJson(obj));
+    }
+    return true;
+}
+
+SqlStatement UpsertStatement(const Account& account) {
+    return {
+        std::string("INSERT INTO accounts (") + kAccountColumns + ") VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET product_name_url = excluded.product_name_url, "
+        "username = excluded.username, password = excluded.password, "
+        "additional = excluded.additional, created_at = excluded.created_at "
+        "RETURNING " + kAccountColumns,
+        { account.id, account.encryptedProduct, account.encryptedUsername, account.encryptedPassword,
+          account.encryptedAdditional, WideToUtf8(account.createdAt) }
+    };
 }
 
 bool LoadBackupAccounts(std::vector<Account>& rows, std::wstring& error) {
@@ -1238,36 +1292,27 @@ void RemoveAccount(std::vector<Account>& rows, const std::string& id) {
     }), rows.end());
 }
 
-bool FetchRemoteAccounts(SupabaseClient& client, std::vector<Account>& rows, DWORD& status, std::string& response, std::wstring& error) {
+bool FetchRemoteAccounts(TursoClient& client, std::vector<Account>& rows, DWORD& status, std::string& response, std::wstring& error) {
     response.clear();
-    bool ok = client.Request(L"GET", L"/rest/v1/accounts?select=*&order=created_at.desc", "", status, response, error);
-    if (!ok) return false;
-    return ParseAccounts(response, rows, error);
+    SqlStatement select{std::string("SELECT ") + kAccountColumns + " FROM accounts ORDER BY created_at DESC", {}};
+    return TursoRun(client, {select}, &rows, status, response, error);
 }
 
-bool ParseFirstAccount(const std::string& response, Account& account, std::wstring& error) {
-    std::vector<Account> rows;
-    if (!ParseAccounts(response, rows, error) || rows.empty()) return false;
-    account = rows.front();
-    return true;
-}
-
-bool PushRemoteAccount(SupabaseClient& client, const Account& account, Account& uploaded, std::wstring& error) {
+bool PushRemoteAccount(TursoClient& client, const Account& account, Account& uploaded, std::wstring& error) {
     DWORD status = 0;
     std::string response;
-    bool ok = client.Request(L"POST", L"/rest/v1/accounts", AccountBody(account, false), status, response, error);
+    std::vector<Account> returned;
+    bool ok = TursoRun(client, {UpsertStatement(account)}, &returned, status, response, error);
     if (!ok) {
         error = RequestErrorMessage(L"Upload local backup failed", status, error, response);
         return false;
     }
-    std::wstring parseError;
-    if (ParseFirstAccount(response, uploaded, parseError)) return true;
-    uploaded = account;
+    uploaded = returned.empty() ? account : returned.front();
     return true;
 }
 
 bool RefreshAccounts() {
-    SupabaseClient client(g.supabaseUrl, g.supabaseKey, g.settings);
+    TursoClient client(g.tursoUrl, g.tursoToken, g.settings);
     DWORD status = 0;
     std::string response;
     std::wstring error;
@@ -1352,7 +1397,7 @@ bool SaveAccount() {
         SetStatus(L"Product or URL is required");
         return false;
     }
-    SupabaseClient client(g.supabaseUrl, g.supabaseKey, g.settings);
+    TursoClient client(g.tursoUrl, g.tursoToken, g.settings);
     DWORD status = 0;
     std::string response;
     std::wstring error;
@@ -1363,26 +1408,19 @@ bool SaveAccount() {
         SetStatus(L"Save failed: could not create account id");
         return false;
     }
-    std::string body = AccountBody(account, update);
-    std::wstring path = L"/rest/v1/accounts";
-    const wchar_t* method = L"POST";
-    if (update) {
-        method = L"PATCH";
-        path += L"?id=eq." + Utf8ToWide(UrlEncode(account.id));
-    }
 
     SetStatus(update ? L"Updating account..." : L"Creating account...");
-    bool remoteOk = client.Request(method, path, body, status, response, error);
+    std::vector<Account> returned;
+    bool remoteOk = TursoRun(client, {UpsertStatement(account)}, &returned, status, response, error);
     std::wstring remoteError;
     Account storedAccount = account;
     if (!remoteOk) {
         remoteError = RequestErrorMessage(L"remote save failed", status, error, response);
+    } else if (returned.empty()) {
+        remoteOk = false;
+        remoteError = L"remote save returned no account";
     } else {
-        std::wstring parseError;
-        if (!ParseFirstAccount(response, storedAccount, parseError)) {
-            remoteOk = false;
-            remoteError = L"remote save returned invalid account: " + parseError;
-        }
+        storedAccount = returned.front();
     }
 
     std::vector<Account> localRows;
@@ -1426,14 +1464,13 @@ bool DeleteAccount() {
         return false;
     }
 
-    SupabaseClient client(g.supabaseUrl, g.supabaseKey, g.settings);
+    TursoClient client(g.tursoUrl, g.tursoToken, g.settings);
     DWORD status = 0;
     std::string response;
     std::wstring error;
     std::string id = g.rows[g.selected].id;
-    std::wstring path = L"/rest/v1/accounts?id=eq." + Utf8ToWide(UrlEncode(id));
     SetStatus(L"Deleting account...");
-    bool remoteOk = client.Request(L"DELETE", path, "", status, response, error);
+    bool remoteOk = TursoRun(client, {{"DELETE FROM accounts WHERE id = ?", {id}}}, nullptr, status, response, error);
     std::wstring remoteError;
     if (!remoteOk) {
         remoteError = RequestErrorMessage(L"remote delete failed", status, error, response);
@@ -2079,8 +2116,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         return 0;
     }
 
-    g.supabaseUrl = GetEnvVar(L"SUPABASE_URL");
-    g.supabaseKey = GetEnvVar(L"SUPABASE_KEY");
+    g.tursoUrl = GetEnvVar(L"Turso_URL");
+    if (g.tursoUrl.empty()) g.tursoUrl = kDefaultTursoUrl;
+    g.tursoToken = GetEnvVar(L"Turso_Token");
     LoadSettings();
 
     // ── Master password ────────────────────────────────────────────────────
