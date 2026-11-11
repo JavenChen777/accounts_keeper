@@ -7,6 +7,8 @@ add_executable(AccountsKeeper WIN32
     src/AccountsKeeper.rc
 )
 
+set_property(TARGET AccountsKeeper PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+
 target_compile_features(AccountsKeeper PRIVATE cxx_std_17)
 target_compile_definitions(AccountsKeeper PRIVATE
     UNICODE

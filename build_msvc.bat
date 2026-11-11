@@ -17,7 +17,7 @@ if not exist build-direct mkdir build-direct
 
 rc /nologo /fo build-direct\AccountsKeeper.res src\AccountsKeeper.rc || exit /b 1
 
-cl /nologo /std:c++17 /EHsc ^
+cl /nologo /std:c++17 /EHsc /MT ^
   /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
   /Fo:build-direct\ /Fe:build-direct\AccountsKeeper.exe src\main.cpp build-direct\AccountsKeeper.res ^
   /link /SUBSYSTEM:WINDOWS ^
